@@ -47,7 +47,7 @@ class PostInput(BaseModel):
         }
 
 class AnalysisResponse(BaseModel):
-    final_answer: str
+    final_action: str
     verdict: str
     summary: str
     confidence_score: int
@@ -151,24 +151,28 @@ def spatiotemporal_agent(message: str, timestamp: str, location: str, other_repo
         return {"consistency": "Unknown", "reason": "Failed to parse LLM response."}
 
 def synthesis_agent(initial_report: dict, spatiotemporal_report: dict, original_message: str) -> dict:
-    """Synthesizes all reports into a final verdict."""
+    """Synthesizes all reports into a final verdict and classifies the need."""
     prompt = f"""
-    You are the Lead Analyst for a Crisis Information Verification Unit. You have received reports from your specialized agents about a social media message. Your job is to synthesize these reports and provide a final verdict.
+    You are the Lead Analyst for a Crisis Information Verification Unit. You have received reports from your specialized agents about a social media message. Your job is to synthesize these reports, provide a final verdict, and classify the message's need.
+
     Original Message: "{original_message}"
+
     Agent Reports:
     - Initial Analysis Report (Urgency & Content Risk): {json.dumps(initial_report)}
     - Spatiotemporal Agent (Consistency Check): {json.dumps(spatiotemporal_report)}
+
     Based on the available reports, provide a final analysis.
-    Respond in JSON format with three keys:
+    Respond in JSON format with four keys:
     1. "verdict": "Verified Official", "Likely True", "Unverified - High Priority", "Unverified - Low Priority", "Likely False", or "Misinformation/Harmful".
     2. "summary": A one-sentence summary of your conclusion, based ONLY on the provided reports.
     3. "confidence_score": A score from 0 to 100 in your verdict.
+    4. "actionable_category": If the message is a credible request for help, classify it as "Needs Rescue", "Needs Food/Water", or "Needs Medical". If the message is not a request for help, is likely false, or is just informational, classify it as "Safe".
     """
     response_text = get_llm_response(prompt)
     try:
         return json.loads(response_text)
     except (json.JSONDecodeError, TypeError, AttributeError):
-        return {"verdict": "Error", "summary": "Failed to synthesize final report.", "confidence_score": 0}
+        return {"verdict": "Error", "summary": "Failed to synthesize final report.", "confidence_score": 0, "actionable_category": "Safe"}
 
 def get_relevant_context(input_post: dict, verified_df: pd.DataFrame) -> str:
     """Filters the verified reports DataFrame to find reports from the same day."""
@@ -195,13 +199,14 @@ def load_verified_reports(filepath: str) -> pd.DataFrame | None:
         print(f"An error occurred loading the verified reports: {e}.")
         return None
 
-def get_binary_verdict(final_verdict: dict) -> str:
-    """Converts the detailed final verdict into a simple 'Yes' (act on it) or 'No'."""
+def get_final_action(final_verdict: dict) -> str:
+    """Returns the specific action category if the verdict is credible, otherwise returns 'Safe'."""
     verdict = final_verdict.get('verdict', 'Error')
+    # Only return a specific need if the information is considered trustworthy
     if verdict in ["Verified Official", "Likely True", "Unverified - High Priority"]:
-        return "Positive"
+        return final_verdict.get("actionable_category", "Safe")
     else:
-        return "Negative"
+        return "Safe"
 
 # --- Orchestrator ---
 def run_analysis_pipeline(post_data: dict, verified_context_df: pd.DataFrame) -> dict:
@@ -240,10 +245,10 @@ async def analyze_message(post: PostInput):
         analysis_results = run_analysis_pipeline(post.model_dump(), verified_df)
         
         final_verdict_json = analysis_results['final_verdict']
-        binary_answer = get_binary_verdict(final_verdict_json)
+        final_action = get_final_action(final_verdict_json)
         
         return AnalysisResponse(
-            final_answer=binary_answer,
+            final_action=final_action,
             verdict=final_verdict_json.get('verdict', 'Error'),
             summary=final_verdict_json.get('summary', 'N/A'),
             confidence_score=final_verdict_json.get('confidence_score', 0),
