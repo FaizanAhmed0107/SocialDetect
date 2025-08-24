@@ -29,3 +29,15 @@ res:
         "reason": "The primary report states that the IMD has issued a Red Alert for Chennai due to expected extremely heavy rainfall. This aligns perfectly with the other verified reports, which include an identical IMD Red Alert, advisories for residents to move to higher ground and prepare for evacuation due to flooding risks, and the suspension of Chennai Airport operations due to runway flooding. All reports collectively describe a severe weather event involving heavy rainfall and significant flooding in Chennai."
     }
 }
+
+
+
+GET: http://127.0.0.1:8000/next-post/
+res: 
+
+{
+    "timestamp": "2025-08-23 09:05:00",
+    "lat": 13.0626,
+    "lon": 80.2789,
+    "message": "Just started pouring in Velachery. Sky is completely dark. #ChennaiWeather"
+}
