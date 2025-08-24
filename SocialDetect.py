@@ -9,11 +9,15 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, List
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+import psycopg2
 
 # --- Configuration ---
+load_dotenv() # Load environment variables from .env file
+
 # It's recommended to set the API key as an environment variable for security.
 # Example: export GOOGLE_API_KEY="your_api_key_here"
-API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyAzBsWgFr2YItzRawoQb7fLX8LLomy7Ruc") 
+API_KEY = os.getenv("GOOGLE_API_KEY") 
 
 genai.configure(api_key=API_KEY)
 
@@ -54,26 +58,59 @@ class AnalysisResponse(BaseModel):
     initial_analysis: Dict
     spatiotemporal_analysis: Dict
 
+# --- Global State ---
 # This will hold the loaded DataFrame in memory
 verified_df = None
+# Database connection and state
+db_conn = None
+db_cursor = None
+last_fetched_id = 0
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load verified reports into memory when the API server starts."""
-    global verified_df
+    """Load verified reports and connect to DB on startup."""
+    global verified_df, db_conn, db_cursor, last_fetched_id
+    
+    # 1. Load verified reports for context
     verified_reports_filepath = 'verified.csv'
     print(f"Loading verified reports from '{verified_reports_filepath}'...")
     verified_df = load_verified_reports(verified_reports_filepath)
     if verified_df is None:
-        print("CRITICAL ERROR: 'verified.csv' could not be loaded. The Spatiotemporal Agent will have no context.")
-        # Create an empty DataFrame so the app doesn't crash on startup
+        print("WARNING: 'verified.csv' not found. Spatiotemporal Agent will have no context.")
         verified_df = pd.DataFrame(columns=['timestamp', 'lat', 'lon', 'message'])
         verified_df['timestamp'] = pd.to_datetime(verified_df['timestamp'])
     else:
         print("Context from verified reports loaded successfully.")
+
+    # 2. Connect to the database
+    try:
+        print("Connecting to the database...")
+        db_conn = psycopg2.connect(
+            user=os.getenv("user"),
+            password=os.getenv("password"),
+            host=os.getenv("host"),
+            port=os.getenv("port"),
+            dbname=os.getenv("dbname")
+        )
+        db_cursor = db_conn.cursor()
+        last_fetched_id = 0
+        print("Database connection successful.")
+    except (Exception, psycopg2.Error) as error:
+        print(f"CRITICAL ERROR: Could not connect to database: {error}")
+        db_conn = None
+        db_cursor = None
+
     yield
-    # Cleanup logic can go here if needed (e.g., closing database connections)
+    
+    # Cleanup logic runs after the application is done
     print("Shutting down...")
+    if db_cursor:
+        db_cursor.close()
+    if db_conn:
+        db_conn.close()
+        print("Database connection closed.")
+
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
@@ -232,7 +269,7 @@ def run_analysis_pipeline(post_data: dict, verified_context_df: pd.DataFrame) ->
         "final_verdict": final_verdict
     }
 
-# --- API Endpoint ---
+# --- API Endpoints ---
 @app.post("/analyze/", response_model=AnalysisResponse)
 async def analyze_message(post: PostInput):
     """
@@ -259,5 +296,45 @@ async def analyze_message(post: PostInput):
         print(f"An unexpected error occurred during analysis: {e}")
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
 
+@app.get("/next-post/", response_model=PostInput)
+async def get_next_post():
+    """
+    Fetches the next social media post from the database.
+    Loops back to the beginning if it reaches the end.
+    """
+    global last_fetched_id
+    if not db_cursor:
+        raise HTTPException(status_code=503, detail="Database connection is not available.")
+    
+    try:
+        # Use double quotes around "Messages" to preserve the case-sensitive table name.
+        query = 'SELECT id, timestamp, lat, lon, message FROM "Messages" WHERE id > %s ORDER BY id ASC LIMIT 1;'
+        db_cursor.execute(query, (last_fetched_id,))
+        record = db_cursor.fetchone()
+
+        # If no record is found (end of table), loop back to the start
+        if not record:
+            print("Reached end of dataset, looping back to the beginning.")
+            last_fetched_id = 0
+            db_cursor.execute(query, (last_fetched_id,))
+            record = db_cursor.fetchone()
+            if not record:
+                raise HTTPException(status_code=404, detail="No posts found in the database.")
+
+        # Unpack the record
+        post_id, timestamp, lat, lon, message = record
+        last_fetched_id = post_id
+
+        return PostInput(
+            timestamp=str(timestamp), # Ensure timestamp is a string
+            lat=lat,
+            lon=lon,
+            message=message
+        )
+    except Exception as e:
+        print(f"An error occurred while fetching the next post: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch data from the database.")
+
+
 # To run this API, save it as SocialDetect.py and run the following command in your terminal:
-# uvicorn SocialDetect:app --reload
+# python -m uvicorn SocialDetect:app --reload
